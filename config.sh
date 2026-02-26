@@ -1,10 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ===== Auto Detect Helpers =====
+detect_default_node_ip() {
+  local detected=""
+  if command -v ip >/dev/null 2>&1; then
+    detected="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  fi
+  if [[ -z "$detected" ]] && command -v hostname >/dev/null 2>&1; then
+    detected="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  if [[ -z "$detected" ]] && command -v ipconfig >/dev/null 2>&1; then
+    detected="$(ipconfig getifaddr en0 2>/dev/null || true)"
+  fi
+  if [[ -z "$detected" ]]; then
+    detected="127.0.0.1"
+  fi
+  printf '%s' "$detected"
+}
+
+detect_default_nic_name() {
+  local detected=""
+  if command -v ip >/dev/null 2>&1; then
+    detected="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  fi
+  if [[ -z "$detected" ]] && command -v route >/dev/null 2>&1; then
+    detected="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  fi
+  if [[ -z "$detected" ]]; then
+    detected="eth0"
+  fi
+  printf '%s' "$detected"
+}
+
 # ===== Cluster Basics =====
-export HEAD_NODE_IP="${HEAD_NODE_IP:-10.0.0.1}"  # MUST change
-export NODE_IP="${NODE_IP:-$(hostname -I 2>/dev/null | awk '{print $1}' || echo 127.0.0.1)}"
-export NIC_NAME="${NIC_NAME:-eth0}"
+export NODE_IP="${NODE_IP:-$(detect_default_node_ip)}"
+export NIC_NAME="${NIC_NAME:-$(detect_default_nic_name)}"
+export HEAD_NODE_IP="${HEAD_NODE_IP:-$NODE_IP}"
 export NODE_ROLE="${NODE_ROLE:-worker}"  # head | worker
 export GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 
