@@ -1,20 +1,21 @@
 # qwen35-vllm-ray-deploy
 
-使用 **Ray + vLLM** 在 **2 个节点（每节点 8 x 80GB GPU）** 上部署 **Qwen3.5**，默认启用：
+使用 **Ray + vLLM** 在多节点 GPU 集群上部署大模型，支持 **Qwen3.5** 和 **GLM-5** 等模型：
 
-- 1M 上下文（通过 YaRN 扩展参数）
-- 多模态输入（图文）
 - OpenAI 兼容接口（`/v1/chat/completions`）
+- 多机多卡分布式推理（TP + PP）
+- 多模态输入（图文）
 
 ## 1. 项目结构
 
 ```text
 qwen35-vllm-ray-deploy/
-├── config.sh               # 统一参数配置
-├── install_env.sh          # 每个节点安装 Python/Ray/vLLM 依赖
-├── quick_start.sh          # 自动探测 IP/NIC + 一键启动（推荐）
+├── config.sh               # Qwen3.5 统一参数配置
+├── install_env.sh          # Qwen3.5 每节点安装 Python/Ray/vLLM 依赖
+├── quick_start.sh          # Qwen3.5 自动探测 IP/NIC + 一键启动（推荐）
 ├── ray_cluster.sh          # Ray 集群管理：head/worker/stop/status
-├── start_vllm_qwen35.sh    # 在 head 节点启动 vLLM
+├── start_vllm_qwen35.sh    # 在 head 节点启动 vLLM (Qwen3.5)
+├── setup_glm5.sh           # GLM-5 一体化环境配置脚本（含 Ray 集群）
 ├── test_mm_client.py       # 多模态请求样例
 └── README.md
 ```
@@ -138,6 +139,98 @@ curl http://10.0.0.1:8000/v1/chat/completions \
 - `ALLOWED_MEDIA_DOMAINS="your-domain-a your-domain-b"`
 
 脚本会自动加上 `--allowed-media-domains` 并禁用重定向，降低 SSRF 风险。
+
+---
+
+## GLM-5 部署
+
+### 硬件要求
+
+- 3 节点 x 8 x NVIDIA L20Z (80GB)
+- Ubuntu Noble, CUDA 13.0
+- 节点间网络互通（TCP Socket）
+
+### 环境配置
+
+使用 `setup_glm5.sh` 在每个节点配置环境并组建 Ray 集群。脚本包含：uv 安装、Python 3.12 虚拟环境、vLLM nightly (cu130)、transformers (git main)、NCCL 配置、vLLM 源码补丁、Ray 集群启动。
+
+```bash
+# 节点1 (头节点, 例如 10.2.1.11)
+bash setup_glm5.sh head 10.2.1.11
+
+# 节点2 (工作节点, 例如 10.2.1.22)
+bash setup_glm5.sh worker 10.2.1.11
+
+# 节点3 (工作节点, 例如 10.2.5.21)
+bash setup_glm5.sh worker 10.2.1.11
+```
+
+### 配置项
+
+脚本顶部可修改以下配置：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `VENV_DIR` | `/root/vllm-env` | 虚拟环境路径 |
+| `PYTHON_VERSION` | `3.12` | Python 版本 |
+| `CUDA_VARIANT` | `cu130` | CUDA 变体 |
+| `NETWORK_IFACE` | `intranet_bond` | 节点间通信网卡名 |
+| `RAY_PORT` | `6379` | Ray head 端口 |
+| `MODEL_PATH` | `/root/GLM` | 模型路径 |
+
+### 启动 vLLM 服务
+
+所有节点 setup 完成后，在**头节点**执行：
+
+```bash
+source /root/vllm-env/bin/activate
+
+vllm serve /root/GLM \
+    --host 0.0.0.0 --port 8000 \
+    --tensor-parallel-size 8 --pipeline-parallel-size 3 \
+    --distributed-executor-backend ray \
+    --gpu-memory-utilization 0.92 --max-model-len 65536 \
+    --max-num-batched-tokens 8192 \
+    --tool-call-parser glm47 --reasoning-parser glm45 \
+    --enable-auto-tool-choice --served-model-name glm-5 \
+    --trust-remote-code --enable-prefix-caching --enable-chunked-prefill
+```
+
+### 参数说明
+
+| 参数 | 值 | 说明 |
+|------|------|------|
+| `--tensor-parallel-size` | `8` | 每节点 8 GPU 做张量并行 |
+| `--pipeline-parallel-size` | `3` | 3 节点做流水线并行 |
+| `--distributed-executor-backend` | `ray` | 使用 Ray 做分布式调度 |
+| `--gpu-memory-utilization` | `0.92` | GPU 显存使用率 |
+| `--max-model-len` | `65536` | 最大序列长度 |
+| `--max-num-batched-tokens` | `8192` | 每批最大 token 数 |
+| `--tool-call-parser` | `glm47` | GLM 工具调用解析器 |
+| `--reasoning-parser` | `glm45` | GLM 推理解析器 |
+| `--enable-auto-tool-choice` | - | 启用自动工具选择 |
+| `--served-model-name` | `glm-5` | 对外服务的模型名 |
+| `--trust-remote-code` | - | 信任模型自定义代码 |
+| `--enable-prefix-caching` | - | 启用前缀缓存 |
+| `--enable-chunked-prefill` | - | 启用分块预填充 |
+
+### 调用示例
+
+```bash
+curl http://<HEAD_IP>:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm-5",
+    "messages": [{"role": "user", "content": "介绍一下你自己"}],
+    "max_tokens": 256
+  }'
+```
+
+### vLLM 补丁说明
+
+GLM-5 使用 Dynamic Sparse Attention (DSA)，模型层包含 `self_attn.indexer.k_cache` 等组件。Pipeline Parallel 下每个 rank 只持有部分层，`get_layers_from_vllm_config()` 直接访问 `forward_context[layer_name]` 会触发 `KeyError`。`setup_glm5.sh` 会自动打补丁添加 key 存在性检查。
+
+---
 
 ## 9. 参考文档
 
