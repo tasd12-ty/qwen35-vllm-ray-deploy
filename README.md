@@ -10,11 +10,12 @@
 
 ```text
 qwen35-vllm-ray-deploy/
-├── config.sh               # Qwen3.5 统一参数配置
-├── install_env.sh          # Qwen3.5 每节点安装 Python/Ray/vLLM 依赖
-├── quick_start.sh          # Qwen3.5 自动探测 IP/NIC + 一键启动（推荐）
+├── config.sh               # Qwen3.5-35B 统一参数配置
+├── install_env.sh          # Qwen3.5-35B 每节点安装 Python/Ray/vLLM 依赖
+├── quick_start.sh          # Qwen3.5-35B 自动探测 IP/NIC + 一键启动（推荐）
 ├── ray_cluster.sh          # Ray 集群管理：head/worker/stop/status
-├── start_vllm_qwen35.sh    # 在 head 节点启动 vLLM (Qwen3.5)
+├── start_vllm_qwen35.sh    # 在 head 节点启动 vLLM (Qwen3.5-35B)
+├── setup_qwen35_397b.sh    # Qwen3.5-397B 一体化环境配置脚本（含 Ray 集群）
 ├── setup_glm5.sh           # GLM-5 一体化环境配置脚本（含 Ray 集群）
 ├── test_mm_client.py       # 多模态请求样例
 └── README.md
@@ -142,6 +143,160 @@ curl http://10.0.0.1:8000/v1/chat/completions \
 
 ---
 
+## Qwen3.5-397B-A17B 部署
+
+### 模型概述
+
+[Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B) 是通义千问 3.5 旗舰级 MoE 模型：
+
+- **总参数**: 397B，**激活参数**: 17B（每 token 路由 10 + 1 shared experts）
+- **架构**: Gated DeltaNet（线性注意力）+ Gated Attention（全注意力）混合架构，60 层，512 experts
+- **原生上下文**: 262,144 tokens，可通过 YaRN 扩展至 ~1M tokens
+- **多模态**: 支持图文理解（视觉编码器可选加载）
+- **推荐**: 使用 [FP8 量化版](https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8) 提升推理效率
+
+### 硬件要求
+
+| 配置 | GPU | 显存 | 说明 |
+|------|-----|------|------|
+| **单节点 (推荐)** | 8 x H200 (141GB) | ~1128GB | FP8 权重 ~400GB，充足 KV cache 空间 |
+| **单节点 (紧凑)** | 8 x H100/A100 (80GB) | ~640GB | FP8 勉强可用，需限制上下文长度 |
+| **多节点** | 2+ 节点 x 8 GPU | ≥1280GB | TP=8 + PP=2，显存更充裕 |
+
+### 部署模式
+
+| 模式 | 命令 | 适用场景 |
+|------|------|----------|
+| **EP+DP** (专家并行) | `-dp 8 --enable-expert-parallel` | MoE 高吞吐、高并发，推荐方案 |
+| **TP** (张量并行) | `--tensor-parallel-size 8` | 经典稳定方案，多节点加 PP |
+
+### 环境配置
+
+使用 `setup_qwen35_397b.sh` 一键配置环境并组建 Ray 集群。脚本包含：uv 安装、Python 虚拟环境、vLLM nightly、transformers (git main)、NCCL 配置、Ray 集群启动。
+
+```bash
+# 单节点 (8xH200, EP 模式高吞吐)
+bash setup_qwen35_397b.sh head 10.0.0.1 --deploy-mode ep
+
+# 多节点 TP 模式
+# 节点1 (头节点)
+bash setup_qwen35_397b.sh head 10.0.0.1
+
+# 节点2 (工作节点)
+bash setup_qwen35_397b.sh worker 10.0.0.1
+
+# 启用 1M 长上下文 + 多模态
+bash setup_qwen35_397b.sh head 10.0.0.1 --enable-1m-context --multimodal
+
+# 使用本地已下载的模型
+bash setup_qwen35_397b.sh head 10.0.0.1 --model-path /data/Qwen3.5-397B-A17B-FP8
+```
+
+### 配置项
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--deploy-mode` | `tp` | 部署模式：`tp` (张量并行) 或 `ep` (专家并行) |
+| `--cuda` | `cu121` | CUDA 变体：`cu121` / `cu124` / `cu130` |
+| `--nic` | 自动检测 | 节点间通信网卡名 |
+| `--model-path` | HF 下载 | 本地模型路径 |
+| `--enable-1m-context` | 关闭 | 启用 YaRN 1M 长上下文扩展 |
+| `--multimodal` | 关闭 | 启用多模态 (视觉编码器) |
+| `--language-model-only` | 关闭 | 仅语言模型，省显存 |
+| `--venv-dir` | `/root/qwen397b-env` | 虚拟环境路径 |
+| `--python` | `3.10` | Python 版本 |
+
+### 启动 vLLM 服务
+
+脚本执行完成后会输出对应部署模式的 vLLM 启动命令。以下是常用示例：
+
+**EP 模式 (高吞吐文本)**:
+
+```bash
+source /root/qwen397b-env/bin/activate
+
+vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
+    --host 0.0.0.0 --port 8000 \
+    --served-model-name qwen3.5-397b \
+    -dp 8 \
+    --enable-expert-parallel \
+    --language-model-only \
+    --reasoning-parser qwen3 \
+    --enable-prefix-caching
+```
+
+**TP 模式 (单节点)**:
+
+```bash
+source /root/qwen397b-env/bin/activate
+
+vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
+    --host 0.0.0.0 --port 8000 \
+    --served-model-name qwen3.5-397b \
+    --tensor-parallel-size 8 \
+    --distributed-executor-backend ray \
+    --reasoning-parser qwen3 \
+    --max-model-len 262144 \
+    --gpu-memory-utilization 0.93 \
+    --enable-prefix-caching
+```
+
+**TP 模式 (多节点, TP=8 PP=2)**:
+
+```bash
+vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
+    --host 0.0.0.0 --port 8000 \
+    --served-model-name qwen3.5-397b \
+    --tensor-parallel-size 8 \
+    --pipeline-parallel-size 2 \
+    --distributed-executor-backend ray \
+    --reasoning-parser qwen3 \
+    --max-model-len 262144 \
+    --gpu-memory-utilization 0.93 \
+    --max-num-seqs 4 \
+    --swap-space 32 \
+    --enable-prefix-caching
+```
+
+**低延迟 (MTP 投机解码, 可叠加任意模式)**:
+
+```bash
+# 在上述命令后追加:
+--speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'
+```
+
+**工具调用 (可叠加)**:
+
+```bash
+# 在上述命令后追加:
+--enable-auto-tool-choice --tool-call-parser qwen3_coder
+```
+
+### 调用示例
+
+```bash
+curl http://<HEAD_IP>:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-397b",
+    "messages": [{"role": "user", "content": "介绍一下你自己"}],
+    "max_tokens": 256
+  }'
+```
+
+### 与 Qwen3.5-35B 的区别
+
+| | Qwen3.5-35B-A3B | Qwen3.5-397B-A17B |
+|--|--|--|
+| 总参数 | 35B | 397B |
+| 激活参数 | 3B | 17B |
+| 最少 GPU | 2x8 GPU (TP=8 PP=2) | 8 GPU (FP8, TP=8) |
+| 推荐量化 | 无 (模型较小) | FP8 (必须) |
+| 专家并行 | 不支持 | 支持 (推荐) |
+| MTP 投机 | 不支持 | 支持 |
+
+---
+
 ## GLM-5 部署
 
 ### 硬件要求
@@ -235,8 +390,11 @@ GLM-5 使用 Dynamic Sparse Attention (DSA)，模型层包含 `self_attn.indexer
 ## 9. 参考文档
 
 - [Qwen3.5-35B-A3B (Hugging Face)](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)
+- [Qwen3.5-397B-A17B (Hugging Face)](https://huggingface.co/Qwen/Qwen3.5-397B-A17B)
+- [Qwen3.5-397B-A17B-FP8 (Hugging Face)](https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8)
+- [QwenLM/Qwen3.5 (GitHub)](https://github.com/QwenLM/Qwen3.5)
+- [vLLM Qwen3.5 Recipe](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html)
 - [vLLM Distributed Serving](https://docs.vllm.ai/en/stable/serving/distributed_serving.html)
-- [vLLM Qwen Recipe](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html)
 - [vLLM CLI Serve](https://docs.vllm.ai/en/stable/cli/serve/)
 - [vLLM Multimodal Inputs](https://docs.vllm.ai/en/stable/features/multimodal_inputs/)
 
